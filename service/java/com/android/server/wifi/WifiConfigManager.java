@@ -51,6 +51,7 @@ import android.os.UserManager;
 import android.provider.Settings;
 import android.security.KeyStore;
 import android.text.TextUtils;
+import android.util.ArraySet;
 import android.util.LocalLog;
 import android.util.Log;
 import android.util.SparseArray;
@@ -94,6 +95,7 @@ import java.util.Comparator;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -190,7 +192,7 @@ public class WifiConfigManager {
      */
     private static final int[] NETWORK_SELECTION_DISABLE_THRESHOLD = {
             -1, //  threshold for NETWORK_SELECTION_ENABLE
-            1,  //  threshold for DISABLED_BAD_LINK
+            1,  //  threshold for DISABLED_BAD_LINK (deprecated)
             5,  //  threshold for DISABLED_ASSOCIATION_REJECTION
             5,  //  threshold for DISABLED_AUTHENTICATION_FAILURE
             5,  //  threshold for DISABLED_DHCP_FAILURE
@@ -206,7 +208,7 @@ public class WifiConfigManager {
      */
     private static final int[] NETWORK_SELECTION_DISABLE_TIMEOUT = {
             Integer.MAX_VALUE,  // threshold for NETWORK_SELECTION_ENABLE
-            15,                 // threshold for DISABLED_BAD_LINK
+            15,                 // threshold for DISABLED_BAD_LINK (deprecated)
             5,                  // threshold for DISABLED_ASSOCIATION_REJECTION
             5,                  // threshold for DISABLED_AUTHENTICATION_FAILURE
             5,                  // threshold for DISABLED_DHCP_FAILURE
@@ -242,10 +244,8 @@ public class WifiConfigManager {
     public AtomicInteger mCurrentNetworkBoost = new AtomicInteger();
     public AtomicInteger mBandAward5Ghz = new AtomicInteger();
 
-    /**
-     * If Connectivity Service has triggered an unwanted network disconnect
-     */
-    public long mLastUnwantedNetworkDisconnectTimestamp = 0;
+    // Indicates whether the system is capable of 802.11r fast BSS transition.
+    private boolean mSystemSupportsFastBssTransition = false;
 
     /**
      * Framework keeps a list of ephemeral SSIDs that where deleted by user,
@@ -258,6 +258,12 @@ public class WifiConfigManager {
 
     /* configured networks with network id as the key */
     private final ConfigurationMap mConfiguredNetworks;
+
+    /*
+     * Stores whether carrier networks are configured.
+     * This information is provided externally from the CarrierConfig.
+     */
+    private boolean mHasCarrierConfiguredNetworks;
 
     private final LocalLog mLocalLog;
     private final KeyStore mKeyStore;
@@ -382,6 +388,8 @@ public class WifiConfigManager {
                 R.integer.config_wifi_framework_current_network_boost));
         mNetworkSwitchingBlackListPeriodMs = mContext.getResources().getInteger(
                 R.integer.config_wifi_network_switching_blacklist_time);
+        mSystemSupportsFastBssTransition = mContext.getResources().getBoolean(
+                R.bool.config_wifi_fast_bss_transition_enabled);
 
         boolean hs2on = mContext.getResources().getBoolean(R.bool.config_wifi_hotspot2_enabled);
         boolean hs2onSet = (Settings.Global.getInt(mContext.getContentResolver(),
@@ -493,6 +501,22 @@ public class WifiConfigManager {
      */
     public List<WifiConfiguration> getSavedNetworks() {
         return getSavedNetworks(null);
+    }
+
+    /**
+     * Check if Carrier networks have ben configured.
+     * @return true if carrier networks are present else false.
+     */
+    public boolean hasCarrierNetworks() {
+        return mHasCarrierConfiguredNetworks;
+    }
+
+    /**
+     * Set true/false depending on whether Carrier networks have been configured.
+     * @param hasCarrierNetworks if Carrier networks have been configured.
+     */
+    public void setHasCarrierNetworks(boolean hasCarrierNetworks) {
+        mHasCarrierConfiguredNetworks = hasCarrierNetworks;
     }
 
     /**
@@ -1138,6 +1162,14 @@ public class WifiConfigManager {
         ArrayList<WifiScanner.PnoSettings.PnoNetwork> pnoList = new ArrayList<>();
         ArrayList<WifiConfiguration> wifiConfigurations =
                 new ArrayList<>(mConfiguredNetworks.valuesForCurrentUser());
+        // Remove any permanently disabled networks.
+        Iterator<WifiConfiguration> iter = wifiConfigurations.iterator();
+        while (iter.hasNext()) {
+            WifiConfiguration config = iter.next();
+            if (config.getNetworkSelectionStatus().isNetworkPermanentlyDisabled()) {
+                iter.remove();
+            }
+        }
         Collections.sort(wifiConfigurations, pnoListComparator);
         // Let's use the network list size as the highest priority and then go down from there.
         // So, the most frequently connected network has the highest priority now.
@@ -1232,52 +1264,56 @@ public class WifiConfigManager {
     /*
      * Remove all networks associated with an application
      *
-     * @param packageName name of the package of networks to remove
-     * @return {@code true} if all networks removed successfully, {@code false} otherwise
+     * @param app Application info of the package of networks to remove.
+     * @return the {@link Set} of networks that were removed by this call. Networks which matched
+     *         but failed to remove are omitted from this set.
      */
-    boolean removeNetworksForApp(ApplicationInfo app) {
+    public Set<Integer> removeNetworksForApp(ApplicationInfo app) {
         if (app == null || app.packageName == null) {
-            return false;
+            return Collections.<Integer>emptySet();
         }
 
-        boolean success = true;
-
-        WifiConfiguration [] copiedConfigs =
-                mConfiguredNetworks.valuesForCurrentUser().toArray(new WifiConfiguration[0]);
+        Log.d(TAG, "Remove all networks for app " + app);
+        Set<Integer> removedNetworks = new ArraySet<>();
+        WifiConfiguration[] copiedConfigs =
+                mConfiguredNetworks.valuesForAllUsers().toArray(new WifiConfiguration[0]);
         for (WifiConfiguration config : copiedConfigs) {
             if (app.uid != config.creatorUid || !app.packageName.equals(config.creatorName)) {
                 continue;
             }
-            if (mShowNetworks) {
-                localLog("Removing network " + config.SSID
-                         + ", application \"" + app.packageName + "\" uninstalled"
-                         + " from user " + UserHandle.getUserId(app.uid));
+            localLog("Removing network " + config.SSID
+                    + ", application \"" + app.packageName + "\" uninstalled"
+                    + " from user " + UserHandle.getUserId(app.uid));
+            if (removeNetwork(config.networkId)) {
+                removedNetworks.add(config.networkId);
             }
-            success &= removeNetwork(config.networkId);
         }
-
         saveConfig();
-
-        return success;
+        return removedNetworks;
     }
 
-    boolean removeNetworksForUser(int userId) {
-        boolean success = true;
-
+    /**
+     * Remove all networks associated with a user.
+     *
+     * @param userId The identifier of the user which is being removed.
+     * @return the {@link Set} of networks that were removed by this call. Networks which matched
+     *         but failed to remove are omitted from this set.
+     */
+    Set<Integer> removeNetworksForUser(int userId) {
+        Log.d(TAG, "Remove all networks for user " + userId);
+        Set<Integer> removedNetworks = new ArraySet<>();
         WifiConfiguration[] copiedConfigs =
                 mConfiguredNetworks.valuesForAllUsers().toArray(new WifiConfiguration[0]);
         for (WifiConfiguration config : copiedConfigs) {
             if (userId != UserHandle.getUserId(config.creatorUid)) {
                 continue;
             }
-            success &= removeNetwork(config.networkId);
-            if (mShowNetworks) {
-                localLog("Removing network " + config.SSID
-                        + ", user " + userId + " removed");
+            localLog("Removing network " + config.SSID + ", user " + userId + " removed");
+            if (removeNetwork(config.networkId)) {
+                removedNetworks.add(config.networkId);
             }
         }
-
-        return success;
+        return removedNetworks;
     }
 
     /**
@@ -1669,6 +1705,7 @@ public class WifiConfigManager {
         // 2) mConfiguredNetworks caches a Passpoint network's FQDN the moment the network is added.
         //    Thus, we had to load the FQDNs first.
         mConfiguredNetworks.clear();
+        mScanDetailCaches.clear();
         for (Map.Entry<String, WifiConfiguration> entry : configs.entrySet()) {
             final String configKey = entry.getKey();
             final WifiConfiguration config = entry.getValue();
@@ -1966,7 +2003,8 @@ public class WifiConfigManager {
         // HasEverConnected to be set to false.
         WifiConfiguration originalConfig = new WifiConfiguration(currentConfig);
 
-        if (!mWifiConfigStore.addOrUpdateNetwork(config, currentConfig)) {
+        if (!mWifiConfigStore.addOrUpdateNetwork(config, currentConfig,
+                    mSystemSupportsFastBssTransition)) {
             return new NetworkUpdateResult(INVALID_NETWORK_ID);
         }
         int netId = config.networkId;
@@ -2005,6 +2043,7 @@ public class WifiConfigManager {
                 currentConfig.updateTime = config.updateTime;
                 currentConfig.creationTime = config.creationTime;
                 currentConfig.shared = config.shared;
+                currentConfig.isCarrierNetwork = config.isCarrierNetwork;
             }
             if (DBG) {
                 log("created new config netId=" + Integer.toString(netId)
@@ -2472,20 +2511,8 @@ public class WifiConfigManager {
     }
 
     private Map<HomeSP, PasspointMatch> matchPasspointNetworks(ScanDetail scanDetail) {
+        // Nothing to do if no Hotspot 2.0 provider is configured.
         if (!mMOManager.isConfigured()) {
-            if (mEnableOsuQueries) {
-                NetworkDetail networkDetail = scanDetail.getNetworkDetail();
-                List<Constants.ANQPElementType> querySet =
-                        ANQPFactory.buildQueryList(networkDetail, false, true);
-
-                if (networkDetail.queriable(querySet)) {
-                    querySet = mAnqpCache.initiate(networkDetail, querySet);
-                    if (querySet != null) {
-                        mSupplicantBridge.startANQP(scanDetail, querySet);
-                    }
-                    updateAnqpCache(scanDetail, networkDetail.getANQPElements());
-                }
-            }
             return null;
         }
         NetworkDetail networkDetail = scanDetail.getNetworkDetail();
@@ -3198,6 +3225,33 @@ public class WifiConfigManager {
     }
 
     /**
+     * Saves the network and set the candidate.
+     * @param config WifiConfiguration to save.
+     * @param scanResult ScanResult to be used as the network selection candidate.
+     * @return WifiConfiguration that was saved and with the status updated.
+     */
+    public WifiConfiguration saveNetworkAndSetCandidate(WifiConfiguration config,
+                                                        ScanResult scanResult) {
+        saveNetwork(config, WifiConfiguration.UNKNOWN_UID);
+
+        config.getNetworkSelectionStatus().setCandidate(scanResult);
+        return config;
+    }
+
+
+    /**
+     * Get the Scan Result candidate.
+     * @param config WifiConfiguration to get status for.
+     * @return scanResult which is the selection candidate.
+     */
+    public ScanResult getScanResultCandidate(WifiConfiguration config) {
+        if (config == null) {
+            return null;
+        }
+        return  config.getNetworkSelectionStatus().getCandidate();
+    }
+
+    /**
      * Checks if uid has access to modify config.
      */
     boolean canModifyNetwork(int uid, WifiConfiguration config, boolean onlyAnnotate) {
@@ -3231,29 +3285,6 @@ public class WifiConfigManager {
         } catch (RemoteException e) {
             return false;
         }
-    }
-
-    /** called when CS ask WiFistateMachine to disconnect the current network
-     * because the score is bad.
-     */
-    void handleBadNetworkDisconnectReport(int netId, WifiInfo info) {
-        /* TODO verify the bad network is current */
-        WifiConfiguration config = mConfiguredNetworks.getForCurrentUser(netId);
-        if (config != null) {
-            if ((info.is24GHz() && info.getRssi()
-                    <= WifiQualifiedNetworkSelector.QUALIFIED_RSSI_24G_BAND)
-                    || (info.is5GHz() && info.getRssi()
-                    <= WifiQualifiedNetworkSelector.QUALIFIED_RSSI_5G_BAND)) {
-                // We do not block due to bad RSSI since network selection should not select bad
-                // RSSI candidate
-            } else {
-                // We got disabled but RSSI is good, so disable hard
-                updateNetworkSelectionStatus(config,
-                        WifiConfiguration.NetworkSelectionStatus.DISABLED_BAD_LINK);
-            }
-        }
-        // Record last time Connectivity Service switched us away from WiFi and onto Cell
-        mLastUnwantedNetworkDisconnectTimestamp = mClock.currentTimeMillis();
     }
 
     int getMaxDhcpRetries() {
@@ -3290,10 +3321,20 @@ public class WifiConfigManager {
 
     /**
      * Check if the provided ephemeral network was deleted by the user or not.
-     * @param ssid ssid of the network
+     * @param ssid caller must ensure that the SSID passed thru this API match
+     *        the WifiConfiguration.SSID rules, and thus be surrounded by quotes.
      * @return true if network was deleted, false otherwise.
      */
     public boolean wasEphemeralNetworkDeleted(String ssid) {
         return mDeletedEphemeralSSIDs.contains(ssid);
+    }
+
+    /**
+     * Check if the User has enabled connecting to carrier networks from Settings.
+     * @return true if enabled in Settings, false otherwise.
+     */
+    public boolean getIsCarrierNetworkEnabledByUser() {
+        return android.provider.Settings.Global.getInt(mContext.getContentResolver(),
+                        Settings.Global.WIFI_CONNECT_CARRIER_NETWORKS, 0) == 1;
     }
 }
